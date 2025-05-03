@@ -1,1 +1,44 @@
+name: Scan nginx version
 
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Ежедневный запуск 
+  workflow_dispatch:      # Ручной запуск
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pulling code # подгружаем на playbook
+        uses: actions/checkout@v4
+
+      - name: Set up Docker # устанавливаем докер
+        uses: docker/setup-buildx-action@v2
+        
+      - name: Install jq # устанавливаем JQ 
+        run: sudo apt-get update && sudo apt-get install -y jq
+        
+      - name: Login to Docker Hub # заходим в него
+        uses: docker/login-action@v3  
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Get latest Nginx version 
+        id: nginx-version
+        run: |
+          LATEST=$(curl -s https://hub.docker.com/v2/repositories/library/nginx/tags/?page_size=1 | jq -r '.results[0].name')
+          echo "latest_nginx_version=$LATEST" >> $GITHUB_OUTPUT
+
+      - name: Update Playbook with new version
+        uses: jacobtomlinson/gha-find-replace@v2
+        with:
+          files: 'lab-deploy.yml'
+          find: 'image: nginx:.*'
+          replace: 'image: nginx:${{ steps.nginx-version.outputs.latest_nginx_version }}'
+
+      - name: Install Ansible
+        run: sudo apt-get update && sudo apt-get install -y ansible
+
+      - name: Deploy with Ansible
+        run: ansible-playbook lab-deploy.yml
