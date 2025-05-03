@@ -1,0 +1,115 @@
+---
+- name: Secure Web Application Deployment
+  hosts: localhost
+  connection: local
+  become: yes
+  vars:
+    download_url: "https://github.com/octocat/Hello-World/tarball/master"
+    work_dir: "/opt/webapp"
+    container_name: "nginx"
+    image_version: "1.18.0"
+    vault_addr: "http://127.0.0.1:8200"
+    vault_role_id: "{{ lookup('env', 'VAULT_ROLE_ID') }}"
+    vault_secret_id: "{{ lookup('env', 'VAULT_SECRET_ID') }}"
+
+  tasks:
+  - name: Retrieve secrets from Vault
+    community.hashi_vault.vault_kv2_get: # теперь берем секреты с VAULT
+      url: "{{ vault_addr }}"
+      auth_method: approle
+      role_id: "{{ vault_role_id }}"
+      secret_id: "{{ vault_secret_id }}"
+      engine_mount_point: "secret"
+      path: "VKdz7" 
+    register: vault_secrets
+
+  - name: Set application secrets
+    set_fact:
+      app_user: "{{ vault_secrets.secret.app_user }}"
+      app_password: "{{ vault_secrets.secret.app_password }}"
+      api_token: "{{ vault_secrets.secret.api_token }}"  # Токен из Vault
+ 
+  - name: Ensure nginx group exists
+    group:
+      name: nginx
+      state: present
+
+  - name: Create restricted application user
+    user:
+      name: "{{ app_user }}"
+      password: "{{ app_password | password_hash('sha512') }}"
+      shell: /usr/sbin/nologin  # Блокировка shell доступа
+      groups: "nginx"  # Добавление в группу вебсервера
+      append: yes
+
+  - name: Configure secure workspace
+    file:
+      path: "{{ work_dir }}"
+      state: directory
+      owner: "{{ app_user }}"
+      group: "nginx"
+      mode: '0750'  # Отбираем права у остальных и запись группы
+    tags: deploy
+
+  - name: Download application code
+    get_url:
+      url: "{{ download_url }}"
+      dest: "/tmp/app.tar.gz"
+      checksum: "sha256:9f40b519431e9754a1680244b820877ca975aa969ea4ae72798bfe3f67d0f139" # Проверка контрольной суммы 
+      validate_certs: yes
+
+  - name: Extract application files
+    unarchive:
+      src: "/tmp/app.tar.gz"
+      dest: "{{ work_dir }}"
+      remote_src: yes
+      extra_opts: "--no-same-owner"  # Сохранение оригинальных прав
+
+  - name: Deploy environment configuration
+    copy:
+      dest: "{{ work_dir }}/.env"
+      content: |
+        API_TOKEN={{ api_token }}
+        APP_ENV=production
+      owner: "{{ app_user }}"
+      group: "nginx"
+      mode: '0440'  # Только для чтения владельцем и группой
+
+  - name: Deploy secure index page
+    copy:
+      dest: "{{ work_dir }}/index.html"
+      content: |
+        <!DOCTYPE html>
+        <html>
+        <head><title>Secure Application</title></head>
+        <body>
+          <h1>Authentication Required</h1>
+        </body>
+        </html>
+      owner: "{{ app_user }}"
+      group: "nginx"
+      mode: '0640'
+
+  - name: Deploy hardened Nginx
+    docker_container:
+      name: "{{ container_name }}"
+      image: "nginx:{{ image_version }}"
+      state: started
+      restart_policy: unless-stopped
+      user: "nginx"  # Запуск от непривилегированного пользователя
+      ports:
+        - "443:443"  # Только HTTPS
+      volumes:
+        - "{{ work_dir }}:/usr/share/nginx/html:ro"
+        - "/etc/letsencrypt:/etc/ssl:ro"  # SSL сертификаты
+      env:
+        API_SECRET: "{{ api_token }}"  # Передача токена через переменные окружения
+
+  - name: Schedule token rotation
+    cron:
+      name: "Rotate API token"
+      user: "{{ app_user }}"
+      job: "vault kv put secret/VKdz7/api_token value=$(openssl rand -hex 32)"
+      hour: "0"
+      minute: "0"
+      day: "*/7"  # Ротация каждую неделю
